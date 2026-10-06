@@ -11,11 +11,11 @@ processes and a PostgreSQL (TimescaleDB) database.
 ## How it works (the whole idea)
 
 1. Every 30 s – 2 min a site sends one line:
-   `solar1:12,10,12,32,4.2,1,1,gra,70`
-   = `solar_code : voltage, current, battery_voltage, temperature, internal_battery_volt, psu1, psu2, operator, signal_strength`
+   `solar1: 12,10,10,12,10,32,70,4.2,1,1,gra,70,16-9-2026, 1, 0,90`
+   = `solar_code : solar_voltage, solar_current, sunlight_intensity, battery_voltage, battery_current, temperature, humidity, internal_battery_volt, psu1, psu2, operator, signal_strength, active, server1, server2, data_sequence`
 2. The worker checks `solar1` is in `solar_list` (if not, the line is skipped), then
-   - saves the raw line in **solar_device_data** (never deleted),
-   - works out power = voltage × current,
+   - saves the raw line in **solar_device_data** (never deleted), with **data_time** = whole seconds since that site's previous line (0 for its first),
+   - works out power = solar_voltage × solar_current,
    - works out the small bit of energy made since the previous line, and **adds** it to today's row in **solar_energy_daily**,
    - rewrites the one row for that site in **solar_current_status** (latest power, battery SOC, backup time).
 3. The API only reads those tables. Cards read today's row + the status row. Charts read `solar_energy_daily` (daily / monthly) or `solar_device_data` (last 24 h).
@@ -26,20 +26,21 @@ Because totals are added up as data arrives, the dashboard never has to scan mil
 
 | What | Formula | Where the numbers come from |
 |---|---|---|
-| Current Power (W) | `voltage × current` | latest reading |
-| Energy (kWh) | `watts × seconds since last reading ÷ 3600 ÷ 1000`, added to today | gap is capped at `MAX_GAP_SECONDS` (default 300) |
-| Today's Revenue (৳) | `kWh × tariff_per_kwh` | `solar_list.tariff_per_kwh` (default 10) |
-| Carbon Reduction (kg) | `kWh × co2_kg_per_kwh` | `solar_list.co2_kg_per_kwh` (default 0.55) |
-| Battery SOC (%) | straight line from `batt_empty_volt` (0 %) to `batt_full_volt` (100 %) | `battery_voltage` + the two voltages in `solar_list` (default 11.5 V / 12.8 V) |
-| Backup time (h) | `batt_capacity_ah × batt_nominal_volt × SOC% ÷ load_watt` | needs `batt_capacity_ah` and `load_watt` set, otherwise `null` |
+| Current Power (W) | `solar_voltage × solar_current` | latest reading |
+| Average power | 1st reading: `P1` · 2nd: `(P1 + P2) / 2` · later: `(previous avg + new power) / 2` | kept in `solar_current_status.avg_power_w` |
+| Energy of one reading (kWh) | `avg watts × data_time(s) ÷ 3600 = Wh`, then `÷ 1000`; added to today's total | `data_time` = seconds since the site's previous reading |
+| Today's Revenue (৳) | `Today's Energy × 15.36` | flat PDB unit rate |
+| Carbon Reduction (kg) | `Today's Energy × 0.62` | flat carbon factor |
+| Battery SOC (%) | straight line from 0 % at 11.5 V to 100 % at 12.8 V (scaled by battery size, e.g. ×2 for 24 V) | live `battery_voltage` + `solar_list.battery_voltage` |
+| Backup time (h) | `battery_capacity × SOC% ÷ battery_current` | `solar_list.battery_capacity` + live `battery_current`; `null` unless the battery is discharging |
 
-**Please check these defaults** — they are starting guesses, not facts about your sites:
-- **tariff 10 ৳/kWh** and **CO₂ 0.55 kg/kWh** — set your real values per site.
-- **SOC from voltage** is a rough estimate (voltage moves with load/charging, and differs for lead-acid vs lithium). Set `batt_empty_volt` / `batt_full_volt` for your battery type.
-- **Backup time uses a fixed `load_watt`** because the feed has no load-current field. If you later add one, change `backupHours` in `calc.js` to use it.
-- I assumed `voltage` / `current` are the **solar panel** values and `battery_voltage` is the **site battery bank**. `internal_battery_volt` (4.2) is stored but not used.
+**Please check these assumptions** — they are starting guesses, not facts about your sites:
+- **15.36 ৳/kWh** and **0.62 kg/kWh** are fixed in `calc.js` (`UNIT_RATE`, `CARBON_FACTOR`), the same for all sites.
+- **SOC from voltage** is a rough estimate (voltage moves with load/charging, and differs for lead-acid vs lithium). The 11.5 V / 12.8 V range is in `calc.js`.
+- **Backup time assumes a positive `battery_current` means discharging.** If your logger reports the opposite, set `BATTERY_POSITIVE_IS_DISCHARGE=false` in `.env`.
+- `solar_voltage` / `solar_current` are the **solar panel** values and `battery_voltage` / `battery_current` are the **site battery bank**. `sunlight_intensity`, `humidity`, `internal_battery_volt`, `psu1/2`, `active`, `server1/2` and `data_sequence` are stored but not used in any formula. `active` is kept as text exactly as sent (e.g. `16-9-2026`).
 
-Changing a tariff only affects readings from then on; old days keep the revenue they earned.
+Revenue and carbon are always recalculated from the day's total energy, so they never drift from it.
 "Today" and "this month" follow `TIMEZONE` (Asia/Dhaka), so a new day starts at local midnight.
 
 ## Setup
@@ -57,9 +58,17 @@ psql -U postgres -d solar_monitor -f database/schema.sql
 `schema.sql` runs `CREATE EXTENSION IF NOT EXISTS timescaledb;` itself, so TimescaleDB must be installed on the
 server. It is safe to re-run: nothing is dropped.
 
-### 3. Configure
+**Already running the old version?** Run the migrations instead (once each, in order):
 ```bash
-cp .env.example .env     # set DB_PASSWORD and SOLAR_WS_URL at minimum
+psql -U postgres -d solar_monitor -f migration1.sql
+psql -U postgres -d solar_monitor -f migration2.sql
+```
+
+### 3. Configure
+Set `DB_PASSWORD` and `SOLAR_WS_URL` in `.env` at minimum. Optional:
+```
+MAX_GAP_SECONDS=300     # longest data_time counted as generation; 0 = count it all
+BATTERY_POSITIVE_IS_DISCHARGE=true
 ```
 
 ### 4. Add your sites (before the worker can store anything)
@@ -67,10 +76,13 @@ cp .env.example .env     # set DB_PASSWORD and SOLAR_WS_URL at minimum
 curl -X POST http://localhost:3200/api/solar -H "Content-Type: application/json" \
   -d '{"solar_code":"solar1","solar_name":"Site One"}'
 ```
-Only `solar_code` is required. Add the real settings when you know them:
+Only `solar_code` is required. All the settings can be sent at creation, or added later:
 ```bash
+curl -X POST http://localhost:3200/api/solar -H "Content-Type: application/json" \
+  -d '{"solar_code":"solar1","solar_name":"Site One","solar_panel_voltage":18,"solar_panel_watt":1000,"battery_voltage":12,"battery_capacity":200}'
+
 curl -X PATCH http://localhost:3200/api/solar/solar1 -H "Content-Type: application/json" \
-  -d '{"tariff_per_kwh":12,"batt_capacity_ah":200,"batt_nominal_volt":12,"load_watt":150,"panel_capacity_w":1000}'
+  -d '{"battery_capacity":220}'
 ```
 Or in SQL: `INSERT INTO solar_list (solar_code, solar_name) VALUES ('solar1','Site One');`
 (the worker re-reads `solar_list` every minute).
@@ -90,9 +102,9 @@ pm2 save && pm2 startup
 
 ## Data model
 
-- `solar_list` — the sites (`solar_code`, `solar_name`) + settings used by the formulas.
-- `solar_device_data` — every raw reading, forever (TimescaleDB hypertable), plus the calculated `power_w`.
-- `solar_current_status` — one row per site: latest power, battery voltage, SOC, backup time, last seen.
+- `solar_list` — the sites: `solar_code`, `solar_name`, `solar_panel_voltage`, `solar_panel_watt`, `battery_voltage`, `battery_capacity`.
+- `solar_device_data` — every raw reading, forever (TimescaleDB hypertable), plus the calculated `power_w` and `data_time` (seconds since the site's previous reading).
+- `solar_current_status` — one row per site: latest values, power, SOC, backup time, last seen.
 - `solar_energy_daily` — one row per site per day: kWh, revenue, CO₂, peak power. Feeds the daily and monthly charts.
 
 ## Dashboard → API map
@@ -109,5 +121,5 @@ See `api.md` for every endpoint with examples.
 
 ## Things to know
 - If a site sends nothing for `ONLINE_WINDOW_SECONDS` (default 300) it is shown `online: false` and its current power reads 0.
-- Energy during a feed outage longer than `MAX_GAP_SECONDS` is not estimated — only 5 minutes is counted for that gap.
+- Energy during a feed outage longer than `MAX_GAP_SECONDS` is not estimated — only 5 minutes is counted for that gap. `data_time` still stores the real gap.
 - The API has no login and CORS is open (same as `sa_monitor`). Put it behind your network rules / a proxy before exposing it.

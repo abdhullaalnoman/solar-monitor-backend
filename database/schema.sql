@@ -95,6 +95,7 @@ CREATE TABLE IF NOT EXISTS solar_current_status (
 
     -- Card 1: Current Power Generation
     power_w             NUMERIC(12,2) NOT NULL DEFAULT 0,
+    avg_power_w         NUMERIC(12,2),   -- running average used for energy: (previous avg + new power) / 2
 
     -- Battery
     soc_percent         NUMERIC(6,2),    -- 0-100, NULL if it cannot be calculated
@@ -102,11 +103,12 @@ CREATE TABLE IF NOT EXISTS solar_current_status (
 );
 
 -- ── 4. solar_energy_daily — one row per site per day ──
--- Every reading ADDS its small slice of energy / revenue / CO2 to
--- today's row. Revenue and CO2 are added at the TARIFF_PER_KWH /
--- CO2_KG_PER_KWH that were set in .env at that moment, so changing
--- them later does not rewrite old days. The "day" follows the TIMEZONE in .env (Asia/Dhaka),
--- so a new day starts at local midnight.
+-- Every reading ADDS its energy slice to today's row:
+--   slice (kWh) = avg power (W) x data_time (s) / 3600 / 1000
+-- and the row's revenue / CO2 are then set from the day's total:
+--   revenue = energy_kwh x 15.36        co2_kg = energy_kwh x 0.62
+-- The "day" follows the TIMEZONE in .env (Asia/Dhaka), so a new day starts at local midnight.
+-- This table is the date-wise record: one row per site per date.
 
 CREATE TABLE IF NOT EXISTS solar_energy_daily (
     solar_code      VARCHAR(50)   NOT NULL,

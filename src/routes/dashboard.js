@@ -5,6 +5,7 @@
 // Chart 1:            GET /api/dashboard/:solar_code/power-24h
 // Chart 2:            GET /api/dashboard/:solar_code/daily?month=YYYY-MM
 // Charts 3-5:         GET /api/dashboard/:solar_code/monthly?year=YYYY   (kWh, ৳, kg)
+// Date-wise table:    GET /api/dashboard/:solar_code/energy-by-date?start_date=&end_date=
 // Raw readings:       GET /api/dashboard/:solar_code/raw?start_date=&end_date=
 
 const express = require('express');
@@ -12,7 +13,6 @@ const router  = express.Router();
 const { query } = require('../db');
 
 const TIMEZONE = process.env.TIMEZONE || 'Asia/Dhaka';
-const ONLINE_WINDOW_SECONDS = parseInt(process.env.ONLINE_WINDOW_SECONDS) || 300;
 
 function serverError(res, err) {
   console.error('[DASHBOARD]', err.message);
@@ -34,10 +34,8 @@ const SUMMARY_SQL = `
     l.battery_voltage                                         AS battery_rated_voltage,
     l.battery_capacity,
     c.last_seen_at,
-    COALESCE(c.last_seen_at > NOW() - make_interval(secs => $2), false) AS online,
-    -- Card: Current Power Generation (0 if the site has gone quiet)
-    CASE WHEN c.last_seen_at > NOW() - make_interval(secs => $2)
-         THEN COALESCE(c.power_w, 0) ELSE 0 END               AS current_power_w,
+    -- Card: Current Power Generation = solar_voltage x solar_current of the latest reading
+    COALESCE(c.power_w, 0)                                    AS current_power_w,
     -- Cards: Today's Solar Energy / Carbon Reduction / Today's Revenue
     ROUND(COALESCE(d.energy_kwh, 0), 3)                       AS today_energy_kwh,
     ROUND(COALESCE(d.co2_kg, 0), 3)                           AS today_co2_kg,
@@ -46,6 +44,8 @@ const SUMMARY_SQL = `
     -- Battery
     c.battery_voltage,
     c.battery_current,
+    l.battery_voltage * l.battery_capacity                    AS battery_full_wh,     -- full capacity (Wh)
+    c.battery_remain_wh,                                                              -- energy left (Wh)
     c.soc_percent,
     c.backup_hours,
     -- Weather at the site
@@ -62,14 +62,13 @@ const SUMMARY_SQL = `
 // GET /api/dashboard/summary — every site + overall totals
 router.get('/summary', async (req, res) => {
   try {
-    const result = await query(`${SUMMARY_SQL} ORDER BY l.solar_code`, [TIMEZONE, ONLINE_WINDOW_SECONDS]);
+    const result = await query(`${SUMMARY_SQL} ORDER BY l.solar_code`, [TIMEZONE]);
     const rows = result.rows;
     const sum = (key) => Math.round(rows.reduce((t, r) => t + Number(r[key] || 0), 0) * 1000) / 1000;
     res.json({
       success: true,
       count: rows.length,
       totals: {
-        sites_online: rows.filter(r => r.online).length,
         current_power_w: sum('current_power_w'),
         today_energy_kwh: sum('today_energy_kwh'),
         today_co2_kg: sum('today_co2_kg'),
@@ -84,7 +83,7 @@ router.get('/summary', async (req, res) => {
 router.get('/:solar_code/summary', async (req, res) => {
   const { solar_code } = req.params;
   try {
-    const result = await query(`${SUMMARY_SQL} WHERE l.solar_code = $3`, [TIMEZONE, ONLINE_WINDOW_SECONDS, solar_code]);
+    const result = await query(`${SUMMARY_SQL} WHERE l.solar_code = $2`, [TIMEZONE, solar_code]);
     if (result.rowCount === 0) return notFound(res, solar_code);
     res.json({ success: true, data: result.rows[0] });
   } catch (err) { serverError(res, err); }
@@ -178,6 +177,53 @@ router.get('/:solar_code/monthly', async (req, res) => {
       [solar_code, year || null, TIMEZONE]
     );
     res.json({ success: true, solar_code, count: result.rowCount, data: result.rows });
+  } catch (err) { serverError(res, err); }
+});
+
+// GET /api/dashboard/:solar_code/energy-by-date?start_date=2026-10-01&end_date=2026-10-05
+// Date-wise record: one row per day (energy, revenue, carbon, peak power) for any date range.
+// Days with no data come back as 0. Max range 366 days. Defaults: the last 30 days.
+router.get('/:solar_code/energy-by-date', async (req, res) => {
+  const { solar_code } = req.params;
+  const { start_date, end_date } = req.query;
+  const isDate = (d) => /^\d{4}-\d{2}-\d{2}$/.test(d) && !Number.isNaN(Date.parse(d));
+  if ((start_date && !isDate(start_date)) || (end_date && !isDate(end_date))) {
+    return res.status(400).json({ success: false, error: 'start_date and end_date must look like 2026-10-05' });
+  }
+  if (start_date && end_date && start_date > end_date) {
+    return res.status(400).json({ success: false, error: 'start_date must not be after end_date' });
+  }
+  if (start_date && end_date && (Date.parse(end_date) - Date.parse(start_date)) / 86400000 > 365) {
+    return res.status(400).json({ success: false, error: 'date range is too long (max 366 days)' });
+  }
+
+  try {
+    const siteCheck = await query('SELECT 1 FROM solar_list WHERE solar_code = $1', [solar_code]);
+    if (siteCheck.rowCount === 0) return notFound(res, solar_code);
+
+    const result = await query(
+      `WITH r AS (
+         SELECT COALESCE($3::date, (NOW() AT TIME ZONE $2)::date)                         AS last_day,
+                COALESCE($4::date, COALESCE($3::date, (NOW() AT TIME ZONE $2)::date) - 29) AS first_day
+       )
+       SELECT to_char(g.day, 'YYYY-MM-DD')        AS day,
+              ROUND(COALESCE(d.energy_kwh, 0), 3) AS energy_kwh,
+              ROUND(COALESCE(d.revenue, 0), 2)    AS revenue,
+              ROUND(COALESCE(d.co2_kg, 0), 3)     AS co2_kg,
+              COALESCE(d.peak_power_w, 0)         AS peak_power_w
+       FROM r,
+            generate_series(r.first_day, r.last_day, INTERVAL '1 day') AS g(day)
+       LEFT JOIN solar_energy_daily d
+              ON d.solar_code = $1 AND d.day = g.day::date
+       ORDER BY g.day`,
+      [solar_code, TIMEZONE, end_date || null, start_date || null]
+    );
+    const total = (k) => Math.round(result.rows.reduce((t, r) => t + Number(r[k]), 0) * 1000) / 1000;
+    res.json({
+      success: true, solar_code, count: result.rowCount,
+      totals: { energy_kwh: total('energy_kwh'), revenue: total('revenue'), co2_kg: total('co2_kg') },
+      data: result.rows,
+    });
   } catch (err) { serverError(res, err); }
 });
 

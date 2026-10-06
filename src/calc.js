@@ -1,10 +1,8 @@
 // src/calc.js — every formula in one place.
 
-// Battery SOC range, as a share of the battery's rated voltage (solar_list.battery_voltage).
-// For a 12 V battery: 11.5 V = 0 %  and  12.8 V = 100 %. A 24 V battery scales to 23 V / 25.6 V.
-// Lead-acid vs lithium differ — change these two numbers for your battery type.
-const EMPTY_VOLT_RATIO = 11.5 / 12;
-const FULL_VOLT_RATIO  = 12.8 / 12;
+// Flat rates (fixed values, not per site)
+const CARBON_FACTOR = 0.62;    // kg CO2 saved per kWh
+const UNIT_RATE     = 15.36;   // ৳ per kWh — flat PDB unit rate
 
 function powerW(solarVoltage, solarCurrent) {
   if (solarVoltage == null || solarCurrent == null) return 0;
@@ -12,38 +10,72 @@ function powerW(solarVoltage, solarCurrent) {
   return p > 0 ? round(p, 2) : 0;
 }
 
-function energyKwh(power_w, gapSec, maxGapSec = 300) {
-  const sec = Math.min(Math.max(gapSec, 0), maxGapSec);
-  return (power_w * sec) / 3600 / 1000;
+// Smoothed power used for energy:
+//   1st reading            -> its own power            (P1)
+//   2nd reading            -> (P1 + P2) / 2
+//   every later reading    -> (previous avg + new power) / 2
+function runningAvgPower(prevAvg, power_w) {
+  if (prevAvg == null) return power_w;
+  return (prevAvg + power_w) / 2;
 }
 
-function revenue(kwh, tariffPerKwh) {
-  return kwh * tariffPerKwh;
+// Energy for one reading: avg watts x data_time (seconds -> hours) = Wh, then / 1000 = kWh.
+// maxGapSec stops a long outage from being counted as generation (0 or less = no limit).
+function energyKwh(avgPower_w, dataTimeSec, maxGapSec = 0) {
+  let sec = Math.max(dataTimeSec, 0);
+  if (maxGapSec > 0) sec = Math.min(sec, maxGapSec);
+  const wh = avgPower_w * (sec / 3600);
+  return wh / 1000;
 }
 
-function co2Kg(kwh, co2PerKwh) {
-  return kwh * co2PerKwh;
+// Today's Revenue = Today's Solar Energy x 15.36
+function revenue(kwh, rate = UNIT_RATE) {
+  return kwh * rate;
 }
 
-// batteryVolt = live reading, ratedVolt = solar_list.battery_voltage
-function socPercent(batteryVolt, ratedVolt) {
-  if (batteryVolt == null || !ratedVolt) return null;
-  const empty = ratedVolt * EMPTY_VOLT_RATIO;
-  const full  = ratedVolt * FULL_VOLT_RATIO;
-  const pct = ((batteryVolt - empty) / (full - empty)) * 100;
-  return round(Math.min(100, Math.max(0, pct)), 2);
+// Carbon Emission Reduction = Today's Solar Energy x 0.62
+function co2Kg(kwh, factor = CARBON_FACTOR) {
+  return kwh * factor;
+}
+
+// Full battery capacity in Wh = battery_voltage x battery_capacity (from solar_list)
+function batteryFullWh(batteryVoltage, batteryCapacityAh) {
+  if (!(batteryVoltage > 0) || !(batteryCapacityAh > 0)) return null;
+  return batteryVoltage * batteryCapacityAh;
+}
+
+// Energy left in the battery (Wh) after one reading. Two steps, in this order:
+//   increased = (solar_voltage x solar_current) x (data_time / 3600)    -> remain + increased, never above full
+//   decreased = (battery_voltage x battery_current) x (data_time / 3600) -> remain - decreased, never below 0
+// prevRemain = remain after the previous reading (null = very first reading -> starts full)
+function batteryRemainWh(prevRemain, fullWh, solarPower_w, batteryVoltage, batteryCurrent, dataTimeSec) {
+  if (fullWh == null) return null;
+  const hours = Math.max(dataTimeSec, 0) / 3600;
+  let remain = prevRemain == null ? fullWh : Math.min(prevRemain, fullWh);
+
+  const increased = solarPower_w * hours;
+  remain = Math.min(fullWh, remain + increased);
+
+  const batteryPower_w = (batteryVoltage ?? 0) * (batteryCurrent ?? 0);
+  const decreased = batteryPower_w * hours;
+  remain = Math.max(0, remain - decreased);
+
+  return round(remain, 4);
+}
+
+// SOC % = remain / full x 100
+function socPercent(remainWh, fullWh) {
+  if (remainWh == null || !fullWh) return null;
+  return round(Math.min(100, Math.max(0, (remainWh / fullWh) * 100)), 2);
 }
 
 // Hours the battery can keep supplying the CURRENT discharge rate.
-// capacityAh = solar_list.battery_capacity, batteryCurrent = live battery_current (A).
-// positiveIsDischarge: does a positive battery_current mean the battery is discharging?
-// Returns null when the battery is charging / idle (there is no "backup time" then).
-function backupHours(soc, capacityAh, batteryCurrent, positiveIsDischarge = true) {
-  if (soc == null || !capacityAh || batteryCurrent == null) return null;
-  const dischargeA = positiveIsDischarge ? batteryCurrent : -batteryCurrent;
-  if (dischargeA <= 0) return null;
+// capacityAh = solar_list.battery_capacity, batteryCurrent = live battery_current (A, positive = using the battery).
+// Returns null when the battery is not being used (there is no "backup time" then).
+function backupHours(soc, capacityAh, batteryCurrent) {
+  if (soc == null || !capacityAh || batteryCurrent == null || batteryCurrent <= 0) return null;
   const ahLeft = capacityAh * (soc / 100);
-  return round(ahLeft / dischargeA, 2);
+  return round(ahLeft / batteryCurrent, 2);
 }
 
 function round(n, digits) {
@@ -51,4 +83,4 @@ function round(n, digits) {
   return Math.round(n * f) / f;
 }
 
-module.exports = { powerW, energyKwh, revenue, co2Kg, socPercent, backupHours, round };
+module.exports = { CARBON_FACTOR, UNIT_RATE, powerW, runningAvgPower, energyKwh, revenue, co2Kg, batteryFullWh, batteryRemainWh, socPercent, backupHours, round };
